@@ -15,6 +15,7 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   p  -> pause / resume the policy loop
   k  -> start / stop the C++ control loop
   i  -> blend smoothly to initial pose (or snap if no prior token) and switch to POSE mode
+  o  -> switch to POSE mode without sending the latent initial-pose token
   t  -> change prompt at runtime (publisher sends ``prompt:<text>``)
   [  -> toggle left hand open/closed for initial pose
   ]  -> toggle right hand open/closed for initial pose
@@ -23,6 +24,9 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   f  -> stop recording failure (handled by data exporter)
 """
 
+from __future__ import annotations
+
+from collections import deque
 from dataclasses import dataclass
 import queue
 import threading
@@ -124,6 +128,25 @@ class InferenceConfig:
     verbose_timing: bool = False
     """Whether to always print timing info (not just when loop is slow)."""
 
+    # Optional observation timestamp alignment
+    sync_state_to_image: bool = False
+    """If true, match robot state to the current image timestamp.
+
+    Default false preserves the original inference path: latest camera frame +
+    latest robot state.  When enabled, the main loop buffers recent robot states
+    and each VLA observation uses the state whose PC receive timestamp is closest
+    to the ego-view image timestamp.
+    """
+
+    state_sync_buffer_size: int = 300
+    """Number of recent robot state messages to keep for image/state sync."""
+
+    state_sync_max_age_ms: float = 250.0
+    """Warn when the nearest state/image timestamp delta exceeds this value."""
+
+    state_sync_log_interval: float = 1.0
+    """Minimum seconds between image/state sync debug prints."""
+
 
 def print_green(x):
     print(f"\033[92m{x}\033[0m")
@@ -215,6 +238,11 @@ def prepare_observation_from_sensors(
     robot_model,
     language_prompt: str,
     log_errors: bool = False,
+    sync_state_to_image: bool = False,
+    state_buffer: deque | None = None,
+    state_buffer_lock: threading.Lock | None = None,
+    state_sync_max_age_ms: float = 250.0,
+    state_sync_log_state: dict | None = None,
 ):
     """Read sensors and prepare observation for the VLA policy.
 
@@ -227,7 +255,17 @@ def prepare_observation_from_sensors(
             print("[DEBUG] prepare_observation: waiting for camera msg..", flush=True)
         return None
 
-    state_msg = state_subscriber.get_msg()
+    if sync_state_to_image:
+        state_msg = _select_state_for_image(
+            camera_msg=camera_msg,
+            state_buffer=state_buffer,
+            state_buffer_lock=state_buffer_lock,
+            max_age_ms=state_sync_max_age_ms,
+            log_state=state_sync_log_state,
+        )
+    else:
+        state_msg = state_subscriber.get_msg()
+
     if state_msg is None:
         if log_errors:
             print("[DEBUG] prepare_observation: waiting for state msg..", flush=True)
@@ -273,6 +311,89 @@ def prepare_observation_from_sensors(
     )[np.newaxis, np.newaxis]
 
     return observation
+
+
+def _get_image_timestamp(camera_msg: dict) -> float | None:
+    """Return the ego-view image timestamp, falling back to any image timestamp."""
+    timestamps = camera_msg.get("timestamps", {})
+    if not timestamps:
+        return None
+    if "ego_view" in timestamps:
+        return float(timestamps["ego_view"])
+    return float(next(iter(timestamps.values())))
+
+
+def _poll_state_into_buffer(
+    state_subscriber: ZMQStateSubscriber,
+    state_buffer: deque,
+    state_buffer_lock: threading.Lock,
+):
+    """Poll one latest state message and append it with a PC receive timestamp."""
+    msg = state_subscriber.get_msg(clear=True)
+    if msg is None:
+        return
+
+    receive_time = time.time()
+    if msg.get("ros_timestamp", 0.0) == 0.0:
+        msg["ros_timestamp"] = receive_time
+    msg["_pc_receive_time"] = receive_time
+
+    with state_buffer_lock:
+        state_buffer.append(msg)
+
+
+def _select_state_for_image(
+    camera_msg: dict,
+    state_buffer: deque | None,
+    state_buffer_lock: threading.Lock | None,
+    max_age_ms: float,
+    log_state: dict | None,
+) -> dict | None:
+    """Select the buffered state closest to the image timestamp.
+
+    The C++ debug state packet currently lacks a hardware timestamp in this
+    non-ROS path, so we align using the PC receive timestamp attached when the
+    state was read from ZMQ.  This matches the data-exporter sync strategy and
+    keeps the feature opt-in for deployment.
+    """
+    if state_buffer is None or state_buffer_lock is None:
+        return None
+
+    with state_buffer_lock:
+        states = list(state_buffer)
+
+    if not states:
+        return None
+
+    image_ts = _get_image_timestamp(camera_msg)
+    if image_ts is None:
+        return states[-1]
+
+    selected = min(
+        states,
+        key=lambda msg: abs(float(msg.get("_pc_receive_time", msg["ros_timestamp"])) - image_ts),
+    )
+    selected_ts = float(selected.get("_pc_receive_time", selected["ros_timestamp"]))
+    dt_ms = (selected_ts - image_ts) * 1000.0
+
+    if log_state is not None:
+        now = time.time()
+        last_log = float(log_state.get("last_log_time", 0.0))
+        if now - last_log >= float(log_state.get("log_interval", 1.0)):
+            log_state["last_log_time"] = now
+            print(
+                f"[VLA Sync] image↔state dt={dt_ms:.1f}ms "
+                f"(buffer={len(states)})",
+                flush=True,
+            )
+        elif abs(dt_ms) > max_age_ms:
+            print(
+                f"[VLA Sync] Warning: nearest state/image dt={dt_ms:.1f}ms "
+                f"> {max_age_ms:.1f}ms",
+                flush=True,
+            )
+
+    return selected
 
 
 def run_policy_inference_and_process(policy, observation, robot_model):
@@ -382,6 +503,20 @@ def main(config: InferenceConfig):
         host=config.state_zmq_host,
         port=config.state_zmq_port,
     )
+    state_buffer = deque(maxlen=max(1, config.state_sync_buffer_size))
+    state_buffer_lock = threading.Lock()
+    state_sync_log_state = {
+        "last_log_time": 0.0,
+        "log_interval": config.state_sync_log_interval,
+    }
+    if config.sync_state_to_image:
+        print_green(
+            "VLA image/state timestamp sync enabled "
+            f"(buffer={config.state_sync_buffer_size}, "
+            f"warn>{config.state_sync_max_age_ms:.1f}ms)"
+        )
+    else:
+        print_green("VLA image/state timestamp sync disabled: using latest image + latest state")
 
     camera_subscriber = ComposedCameraClientSensor(
         server_ip=config.camera_host, port=config.camera_port
@@ -571,6 +706,16 @@ def main(config: InferenceConfig):
             cached_action_chunk = None
             action_chunk_index = 0
             print("Cleared cached action chunk, reset frame counter")
+        elif key == "o":
+            if cpp_loop_running and cpp_mode == "PLANNER":
+                if send_cpp_control_command(start=True, planner=False):
+                    print("Switched to POSE mode without sending initial pose token")
+                else:
+                    print("Warning: Failed to switch to POSE mode")
+            elif cpp_loop_running and cpp_mode == "POSE":
+                print("Already in POSE mode")
+            else:
+                print("Note: C++ loop not running - press 'k' to start first")
         elif key == "p":
             pause_loop = not pause_loop
             print(f"{'Paused' if pause_loop else 'Resumed'} policy loop")
@@ -588,7 +733,10 @@ def main(config: InferenceConfig):
                 print("Starting C++ control loop in PLANNER mode...")
                 if send_cpp_control_command(start=True, planner=True):
                     print("Started C++ control loop in PLANNER mode")
-                    print("Press 'i' to send initial pose and switch to POSE mode")
+                    print(
+                        "Press 'o' to switch to POSE without initial token "
+                        "(or 'i' to send initial pose token)"
+                    )
                     if pause_loop:
                         print("Note: Policy loop is paused - press 'p' to resume")
         elif key == "[":
@@ -625,6 +773,11 @@ def main(config: InferenceConfig):
                 robot_model=robot_model,
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
+                sync_state_to_image=config.sync_state_to_image,
+                state_buffer=state_buffer,
+                state_buffer_lock=state_buffer_lock,
+                state_sync_max_age_ms=config.state_sync_max_age_ms,
+                state_sync_log_state=state_sync_log_state,
             ),
             lambda obs: run_policy_inference_and_process(
                 policy=n1_policy,
@@ -639,6 +792,13 @@ def main(config: InferenceConfig):
     try:
         while True:
             t_start = time.monotonic()
+            if config.sync_state_to_image:
+                _poll_state_into_buffer(
+                    state_subscriber=state_subscriber,
+                    state_buffer=state_buffer,
+                    state_buffer_lock=state_buffer_lock,
+                )
+
             check_keyboard_input()
 
             # Consume result first so last_inference_time is fresh before trigger check
