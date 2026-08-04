@@ -213,6 +213,7 @@ sonic_release/
 # Training output logs
 logs_rl/
 logs_eval/
+logs/stream_debug/
 
 # Model checkpoints directory
 models/
