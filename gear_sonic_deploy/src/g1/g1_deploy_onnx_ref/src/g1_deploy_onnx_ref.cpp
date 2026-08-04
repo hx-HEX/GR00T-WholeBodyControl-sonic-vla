@@ -287,6 +287,7 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds STREAMING_DATA_ABSENT_THRESHOLD{150};
     CounterDebouncer streaming_data_absent_debouncer_{100, 500, 50, 1};
     RollingStats<1000> streaming_data_delay_rolling_stats_;
+    std::chrono::steady_clock::time_point last_streaming_delay_warn_time_{};
     std::unique_ptr<AudioThread> audio_thread_;
     
     // =========================================================================
@@ -2980,6 +2981,23 @@ class G1Deploy {
         streaming_data_delay_rolling_stats_.push(static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(streaming_data_delay).count()));
 
         bool streaming_data_absent = streaming_data_delay > STREAMING_DATA_ABSENT_THRESHOLD;
+        if (streaming_data_absent) {
+          auto now = std::chrono::steady_clock::now();
+          if (last_streaming_delay_warn_time_.time_since_epoch().count() == 0 ||
+              now - last_streaming_delay_warn_time_ > std::chrono::seconds(1)) {
+            last_streaming_delay_warn_time_ = now;
+            std::cout << "[STREAMING DIAG] input_update_age="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(streaming_data_delay).count()
+                      << "ms threshold="
+                      << STREAMING_DATA_ABSENT_THRESHOLD.count()
+                      << "ms mean="
+                      << streaming_data_delay_rolling_stats_.mean()
+                      << "ms std="
+                      << streaming_data_delay_rolling_stats_.stddev()
+                      << "ms"
+                      << std::endl;
+          }
+        }
         streaming_data_absent_debouncer_.update(streaming_data_absent);
       }
 
@@ -4468,4 +4486,3 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-

@@ -88,7 +88,7 @@
 class ZMQEndpointInterface : public InputInterface {
 public:
     /// Compile-time toggle for debug log output.
-    static constexpr bool DEBUG_LOGGING = true;
+    static constexpr bool DEBUG_LOGGING = false;
     
     // ------------------------------------------------------------------
     // Per-frame action flags (reset at the start of every update() call)
@@ -1809,11 +1809,12 @@ private:
         
         std::lock_guard<std::mutex> lock(data_mutex_);
         
-        // Print message received info
-        std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic 
-                  << "', protocol_version: " << hdr.version 
-                  << ", num_fields: " << hdr.fields.size() 
-                  << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        if (verbose_) {
+            std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic
+                      << "', protocol_version: " << hdr.version
+                      << ", num_fields: " << hdr.fields.size()
+                      << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        }
         
         // Buffer the received data for processing in handle_input (main thread)
         buffered_header_ = hdr;
