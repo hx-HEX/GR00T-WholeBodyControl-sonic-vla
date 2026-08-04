@@ -1,49 +1,95 @@
-# VLA demo 手动启动命令
+# VLA 实机验证部署流程
 
-当前手动链路需要 5 个终端：
+这份流程用于当前本机环境的 VLA 实机验证：
 
-1. 机器人端 camera server
-2. PC 端 GR00T PolicyServer
-3. PC 端 SONIC deploy
-4. PC 端 VLA inference client
-5. PC 端 keyboard publisher
+- PC workspace: `~/GR00T-WholeBodyControl`
+- Isaac-GR00T repo: `~/GR00T/repos/Isaac-GR00T`
+- Robot IP: `192.168.123.164`
+- Robot user: `unitree`
+- Robot sudo password: `123`
+- Robot camera: RealSense D435I
+- Hand: Inspire/RH56
+- SONIC deploy: low-latency checkpoint
+- VLA checkpoint: `sonic_vla_bottle_to_bin`
 
-终端 1、2、3 如果已经在跑，不要重复启动。
+重要：low-latency SONIC 不要按 `i`。`i` 会发送 VLA client 内置的 `LATENT_INITIAL_MOTION_TOKEN`，这个 token 不一定匹配当前 low-latency SONIC checkpoint，可能导致姿态异常。当前流程使用：
 
-## 终端 1：机器人相机服务器
+```text
+k → o → p
+```
 
-在机器人 `unitree@192.168.123.164` 上运行：
+其中 `o` 是我们新增的安全切换键：只切到 POSE，不发送 initial token。
+
+## 0. 可选：清理旧进程
+
+PC 上：
+
+```bash
+pkill -f run_vla_inference.py || true
+pkill -f run_gr00t_server.py || true
+pkill -f inspire_hand_zmq_bridge || true
+pkill -f pico_manager_thread_server.py || true
+pkill -f g1_deploy_onnx_ref || true
+```
+
+机器人相机/手 SDK 如果需要重启，后面脚本会处理。
+
+## 1. 机器人：启动 RealSense 相机和 Inspire 手 SDK
+
+在 PC 上执行：
 
 ```bash
 cd ~/GR00T-WholeBodyControl
-source .venv_camera/bin/activate
-python -m gear_sonic.camera.composed_camera --ego-view-camera usb --ego-view-device-id 5 --port 5555
+
+./tools/start_robot_realsense_camera.sh
 ```
 
-## 终端 2：PC 启动 PolicyServer
-
-```bash
-cd ~/Isaac-GR00T
-
-~/GR00T-WholeBodyControl/.venv_inference/bin/python \
-  gr00t/eval/run_gr00t_server.py \
-  --model-path ~/GR00T/models/huggingface_and_checkpoints/gr00t-n17-g1-grab-bottle-rh-371ep-v10-finetune/checkpoint-30000 \
-  --embodiment-tag UNITREE_G1_SONIC \
-  --device cuda:0 \
-  --host 0.0.0.0 \
-  --port 5550
-```
-
-看到下面输出后保持终端不关：
+预期：
 
 ```text
-Server is ready and listening on tcp://0.0.0.0:5550
+[camera] restarting robot camera server on port 5555
+[hand] restarting Inspire hand SDK inspire_g1
 ```
 
-## 终端 3：PC 启动 low-latency SONIC deploy
+如果脚本因为 sudo 密码卡住，可以手动 SSH 到机器人：
+
+```bash
+ssh unitree@192.168.123.164
+```
+
+机器人上启动相机：
+
+```bash
+cd ~/GR00T-WholeBodyControl
+
+pkill -f realsense_color_zmq_server_py38.py || true
+pkill -f composed_camera || true
+
+/usr/bin/python3 tools/realsense_color_zmq_server_py38.py \
+  --port 5555 \
+  --width 640 \
+  --height 480 \
+  --fps 30
+```
+
+另一个机器人终端启动手 SDK：
+
+```bash
+cd /home/unitree/develop/dfx_inspire_service/build
+
+echo 123 | sudo -S pkill -f inspire_g1 || true
+
+echo 123 | sudo -S nohup ./inspire_g1 > /tmp/inspire_g1.log 2>&1 &
+
+tail -f /tmp/inspire_g1.log
+```
+
+## 2. PC：启动 low-latency SONIC deploy
 
 ```bash
 cd ~/GR00T-WholeBodyControl/gear_sonic_deploy
+
+export TensorRT_ROOT=$HOME/TensorRT
 
 ./deploy.sh \
   --cp policy/low_latency/model \
@@ -52,59 +98,155 @@ cd ~/GR00T-WholeBodyControl/gear_sonic_deploy
   real
 ```
 
-看到下面输出后说明 SONIC deploy 初始化完成，但还没有进入 control：
+提示时输入：
+
+```text
+y
+```
+
+等到看到：
 
 ```text
 Init Done
 ```
 
-## 终端 4：PC 启动 VLA inference client
+## 3. PC：启动 VLA PolicyServer
+
+### 10k checkpoint
+
+```bash
+cd ~/GR00T/repos/Isaac-GR00T
+
+~/GR00T-WholeBodyControl/.venv_inference/bin/python \
+  gr00t/eval/run_gr00t_server.py \
+  --model-path ~/GR00T/models/huggingface_and_checkpoints/sonic_vla_bottle_to_bin/10k-checkpoint-10000 \
+  --embodiment-tag UNITREE_G1_SONIC \
+  --device cuda:0 \
+  --host 0.0.0.0 \
+  --port 5550
+```
+
+### 20k checkpoint
+
+如果要测试 20k，先停掉旧 PolicyServer：
+
+```bash
+pkill -f run_gr00t_server.py || true
+```
+
+然后启动：
+
+```bash
+cd ~/GR00T/repos/Isaac-GR00T
+
+~/GR00T-WholeBodyControl/.venv_inference/bin/python \
+  gr00t/eval/run_gr00t_server.py \
+  --model-path ~/GR00T/models/huggingface_and_checkpoints/sonic_vla_bottle_to_bin/20k-checkpoint-20000 \
+  --embodiment-tag UNITREE_G1_SONIC \
+  --device cuda:0 \
+  --host 0.0.0.0 \
+  --port 5550
+```
+
+预期：
+
+```text
+Server is ready and listening on tcp://0.0.0.0:5550
+```
+
+## 4. PC：启动 VLA inference client
+
+需要重启此进程才能使用新增的 `o` 键。
 
 ```bash
 cd ~/GR00T-WholeBodyControl
+
 source .venv_inference/bin/activate
 
 python gear_sonic/scripts/run_vla_inference.py \
   --host localhost \
   --port 5550 \
   --embodiment-tag unitree_g1_sonic \
-  --prompt "reach the bottle with the right hand" \
+  --prompt "pick up the bottle and put it into the trash bin" \
   --camera-host 192.168.123.164 \
-  --camera-port 5555
+  --camera-port 5555 \
+  --sync-state-to-image \
+  --state-sync-buffer-size 300 \
+  --state-sync-max-age-ms 250
 ```
 
-如果此时看到：
+如果看到：
 
 ```text
 waiting for state msg
 ```
 
-是正常的。因为 SONIC deploy 还没有收到 `k` 命令进入 `CONTROL`，暂时不会发布 `g1_debug` 状态。
+说明 SONIC deploy 还没有进入 control 或还没发布 `g1_debug`，不一定是错误。
 
-## 终端 5：PC 启动 keyboard publisher
+## 5. PC：启动 keyboard publisher
 
-复制下面这一整行：
+复制这一整行：
 
 ```bash
-cd ~/GR00T-WholeBodyControl && source .venv_inference/bin/activate && python -c 'import base64; exec(base64.b64decode("aW1wb3J0IHptcSx0aW1lCmN0eD16bXEuQ29udGV4dCgpCnB1Yj1jdHguc29ja2V0KHptcS5QVUIpCnB1Yi5iaW5kKCJ0Y3A6Ly9sb2NhbGhvc3Q6NTU4MCIpCnRpbWUuc2xlZXAoMC41KQpwcmludCgiS2V5Ym9hcmQgcHVibGlzaGVyIHJlYWR5LiBUeXBlIGsvaS9wIHRoZW4gRW50ZXIuIikKd2hpbGUgVHJ1ZToKICAgIGtleT1pbnB1dCgpCiAgICBwdWIuc2VuZF9zdHJpbmcoa2V5KQogICAgcHJpbnQoIlNlbnQ6Iiwga2V5KQo="))'
+cd ~/GR00T-WholeBodyControl && source .venv_inference/bin/activate && python -c 'import zmq,time; ctx=zmq.Context(); pub=ctx.socket(zmq.PUB); pub.bind("tcp://localhost:5580"); time.sleep(0.5); print("ready: input k/o/p or t <new prompt>"); exec("while True:\n    s=input()\n    pub.send_string(s)\n    print(\"Sent:\", s)")'
 ```
 
-看到：
+后续所有 VLA 控制按键都在这个终端输入。
 
-```text
-Keyboard publisher ready. Type k/i/p then Enter.
+## 6. PC：启动 Inspire 手桥
+
+```bash
+cd ~/GR00T-WholeBodyControl
+
+tools/build/inspire_hand_zmq_bridge \
+  --iface enp6s0 \
+  --max-close 0.8
 ```
 
-之后所有按键都在这个终端 5 里输入，不是在 VLA client 终端输入。
+如果左右手反了：
 
-## 执行顺序
+```bash
+cd ~/GR00T-WholeBodyControl
 
-第一次测试建议严格按这个顺序：
+tools/build/inspire_hand_zmq_bridge \
+  --iface enp6s0 \
+  --max-close 0.8 \
+  --swap-hands
+```
+
+## 7. VLA 操作顺序
+
+不要按 `i`。
+
+在 keyboard publisher 终端依次输入：
 
 ```text
 k
-i
+```
+
+等待 SONIC 进入 PLANNER，然后输入：
+
+```text
+o
+```
+
+这一步只切到 POSE，不发送 initial token。
+
+确认机器人仍稳定后，输入：
+
+```text
 p
+```
+
+此时 VLA client 会开始持续发送推理动作。
+
+推荐首次验证节奏：
+
+```text
+k
+o
+p
+运行 1~2 秒
 p
 k
 ```
@@ -113,163 +255,114 @@ k
 
 | 输入 | 作用 |
 |---|---|
-| `k` | 启动 SONIC C++ control loop，进入 `CONTROL`，开始发布 `g1_debug` |
-| `i` | 切到 POSE mode，并发送 initial pose |
-| `p` | 恢复 VLA policy loop，开始执行 prompt |
-| `p` | 暂停 VLA policy loop |
-| `k` | 停止 SONIC C++ control loop |
+| `k` | 启动/停止 SONIC C++ control loop |
+| `o` | 从 PLANNER 切到 POSE，不发送 initial token |
+| `p` | pause/resume VLA policy loop |
+| `t <prompt>` | 运行时切换语言命令 |
+| `i` | 发送内置 initial token；low-latency 版本不要用 |
 
-推荐节奏：
-
-```text
-k
-i
-等待机器人稳定
-p
-运行 1-2 秒
-p
-k
-```
-
-## 修改 prompt
-
-在终端 5 输入：
-
-```text
-t reach the box with the right hand
-```
-
-当前建议先使用温和 prompt：
-
-```text
-reach the bottle with the right hand
-```
-
-不要一开始使用：
-
-```text
-grab the bottle
-pick up the bottle
-walk to the bottle
-```
-
-## 安全注意
-
-- 不要在机器人悬空时跑完整 VLA 闭环。
-- 第一次只运行 1-2 秒。
-- 如果动作趋势不对，先按 `p` 暂停，再按 `k` 停止。
-- 当前机器人是假手，抓取类 prompt 不可靠，先做 reach 类验证。
-
-## 对比测试：使用 default/release SONIC deploy 测试 initial pose
-
-如果 low-latency 下按 `i` 后机器人明显前倾/歪站，可以测试 default/release SONIC 是否和 VLA initial token 更匹配。
-
-注意：这个测试只验证 `k -> i`，不要按 `p` 启动 VLA。
-
-### 1. 停掉当前 low-latency SONIC deploy
-
-在当前 SONIC deploy 终端里按：
-
-```text
-Ctrl+C
-```
-
-如果进程没有退出，可以新开终端查：
-
-```bash
-ss -lntp | grep 5557
-```
-
-必要时杀掉旧 deploy 进程：
-
-```bash
-pkill -f g1_deploy_onnx_ref
-```
-
-### 2. 启动 default/release SONIC deploy
-
-`deploy.sh` 默认就是：
-
-```text
-policy/release/model
-policy/release/observation_config.yaml
-```
-
-所以不要加 low-latency 的 `--cp` 和 `--obs-config`。
-
-```bash
-cd ~/GR00T-WholeBodyControl/gear_sonic_deploy
-
-./deploy.sh \
-  --input-type zmq_manager \
-  real
-```
-
-看到：
-
-```text
-Init Done
-```
-
-说明 release deploy 初始化完成。
-
-### 3. 复用原来的 VLA client 和 keyboard publisher
-
-如果终端 4 的 VLA client 还在跑，可以先保持。
-
-如果已经退出，重新启动：
-
-```bash
-cd ~/GR00T-WholeBodyControl
-source .venv_inference/bin/activate
-
-python gear_sonic/scripts/run_vla_inference.py \
-  --host localhost \
-  --port 5550 \
-  --embodiment-tag unitree_g1_sonic \
-  --prompt "reach the bottle with the right hand" \
-  --camera-host 192.168.123.164 \
-  --camera-port 5555
-```
-
-如果 keyboard publisher 不在跑，重新启动：
-
-```bash
-cd ~/GR00T-WholeBodyControl && source .venv_inference/bin/activate && python -c 'import base64; exec(base64.b64decode("aW1wb3J0IHptcSx0aW1lCmN0eD16bXEuQ29udGV4dCgpCnB1Yj1jdHguc29ja2V0KHptcS5QVUIpCnB1Yi5iaW5kKCJ0Y3A6Ly9sb2NhbGhvc3Q6NTU4MCIpCnRpbWUuc2xlZXAoMC41KQpwcmludCgiS2V5Ym9hcmQgcHVibGlzaGVyIHJlYWR5LiBUeXBlIGsvaS9wIHRoZW4gRW50ZXIuIikKd2hpbGUgVHJ1ZToKICAgIGtleT1pbnB1dCgpCiAgICBwdWIuc2VuZF9zdHJpbmcoa2V5KQogICAgcHJpbnQoIlNlbnQ6Iiwga2V5KQo="))'
-```
-
-### 4. 只测试 release initial pose
+## 8. 切换语言命令
 
 在 keyboard publisher 终端输入：
 
 ```text
-k
+t pick up the bottle and put it into the trash bin
 ```
 
-确认机器人能站稳。
-
-然后输入：
+或者更保守一点：
 
 ```text
-i
+t reach the bottle with the right hand
 ```
 
-观察 initial pose 是否还会：
+注意：如果模型/数据主要是“桌上拿水瓶并丢进垃圾桶”，prompt 应尽量接近训练数据的语言分布。
 
-- 双手明显向前折；
-- 身体右前方前倾；
-- 站姿明显歪。
+## 9. 可视化相机
 
-不要按：
+可选，用来确认 RealSense 是否看到物体：
+
+```bash
+cd ~/GR00T-WholeBodyControl
+
+source .venv_data_collection/bin/activate
+
+python gear_sonic/scripts/run_camera_viewer.py \
+  --camera-host 192.168.123.164 \
+  --camera-port 5555
+```
+
+如果出现 OpenCV `imshow` 不支持，说明当前环境缺 GUI highgui，数据采集/推理本身不一定受影响。
+
+## 10. 常见问题
+
+### 机器人不动
+
+检查：
+
+- PolicyServer 是否显示 ready
+- VLA client 是否连接到 PolicyServer
+- SONIC deploy 是否 `Init Done`
+- 是否按了 `k → o → p`
+- VLA client 是否打印：
 
 ```text
-p
+New action chunk
+ZMQ: Sent latent action
 ```
 
-### 5. 判断结果
+### 不要用 `i`
 
-| 结果 | 解释 |
-|---|---|
-| release 下 `i` 正常，low-latency 下 `i` 歪 | VLA/initial token 更可能和 release SONIC 对齐，不适合当前 low-latency deploy |
-| release 和 low-latency 下 `i` 都歪 | hard-coded initial token 可能和当前安装的 SONIC checkpoint 都不匹配，需要重新找/生成 safe initial token |
-| release 下 `i` 更差 | 不继续实机 VLA，回到源码/文档核对该 VLA checkpoint 训练时对应的 SONIC checkpoint |
+`i` 会发：
+
+```text
+LATENT_INITIAL_MOTION_TOKEN
+```
+
+当前 low-latency SONIC checkpoint 不保证匹配这个 token。用：
+
+```text
+o
+```
+
+### 5550 / 5556 端口占用
+
+```bash
+ss -ltnp | grep -E ':5550|:5556|:5557|:5580'
+```
+
+按需清理：
+
+```bash
+pkill -f run_gr00t_server.py || true
+pkill -f run_vla_inference.py || true
+pkill -f pico_manager_thread_server.py || true
+pkill -f g1_deploy_onnx_ref || true
+```
+
+### 相机无帧
+
+PC 上：
+
+```bash
+cd ~/GR00T-WholeBodyControl
+
+./tools/start_robot_realsense_camera.sh
+```
+
+然后再启动 viewer 或 VLA client。
+
+### 手不动
+
+确认机器人端 Inspire SDK 正在运行：
+
+```bash
+ssh unitree@192.168.123.164
+
+ps aux | grep -E 'inspire_g1' | grep -v grep
+```
+
+确认 PC 手桥正在运行：
+
+```bash
+ps aux | grep -E 'inspire_hand_zmq_bridge' | grep -v grep
+```
