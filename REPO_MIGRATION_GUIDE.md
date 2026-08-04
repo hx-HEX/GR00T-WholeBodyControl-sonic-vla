@@ -375,9 +375,33 @@ clone 两个源码仓库：
 ```bash
 cd ~/GR00T/repos
 
-git clone git@github.com:<org>/GR00T-WholeBodyControl-sonic-vla.git
-git clone git@github.com:<org>/Isaac-GR00T-sonic-vla.git
+GIT_LFS_SKIP_SMUDGE=1 git clone git@github.com:<org>/GR00T-WholeBodyControl-sonic-vla.git
+GIT_LFS_SKIP_SMUDGE=1 git clone git@github.com:<org>/Isaac-GR00T-sonic-vla.git
 ```
+
+注意：这两个自建仓库主要保存源码改动和 LFS 指针，不建议把官方仓库里的所有 LFS 对象重新上传到自己的 GitHub LFS 配额里。clone 后需要把官方仓库设为 `upstream`，再从官方拉 LFS 对象。
+
+`GR00T-WholeBodyControl`：
+
+```bash
+cd ~/GR00T/repos/GR00T-WholeBodyControl
+
+git remote add upstream https://github.com/NVlabs/GR00T-WholeBodyControl.git
+git lfs fetch upstream
+git lfs checkout
+```
+
+`Isaac-GR00T`：
+
+```bash
+cd ~/GR00T/repos/Isaac-GR00T
+
+git remote add upstream https://github.com/NVIDIA/Isaac-GR00T.git
+git lfs fetch upstream
+git lfs checkout
+```
+
+如果只做源码查看或轻量开发，可以先不执行 `git lfs fetch/checkout`。如果要真实部署、编译或运行官方示例，需要把相关 LFS 对象拉下来。
 
 复制模型和 checkpoint：
 
@@ -429,4 +453,3 @@ PICO/XRoboToolkit version:
 ```
 
 这样另一台 PC 出问题时，可以先确认是不是源码版本、模型版本或机器人配置不一致。
-
