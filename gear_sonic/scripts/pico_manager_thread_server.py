@@ -766,6 +766,43 @@ def compute_hand_joints_from_inputs(
     return left_hand_joints, right_hand_joints
 
 
+OPEN_HAND_JOINTS_7D = np.zeros(7, dtype=np.float32)
+
+
+def _open_hand_pose_message() -> bytes:
+    """Build a minimal pose message that only resets both 7D Dex3 hand buffers."""
+    return pack_pose_message(
+        {
+            "left_hand_joints": OPEN_HAND_JOINTS_7D.copy(),
+            "right_hand_joints": OPEN_HAND_JOINTS_7D.copy(),
+        },
+        topic="pose",
+    )
+
+
+def _open_hand_planner_message(facing: list[float] | None = None) -> bytes:
+    """Build a minimal planner message that resets both 7D Dex3 hand buffers."""
+    if facing is None:
+        facing = [1.0, 0.0, 0.0]
+    return build_planner_message(
+        LocomotionMode.IDLE.value,
+        [0.0, 0.0, 0.0],
+        facing,
+        speed=-1.0,
+        height=-1.0,
+        left_hand_position=OPEN_HAND_JOINTS_7D.tolist(),
+        right_hand_position=OPEN_HAND_JOINTS_7D.tolist(),
+    )
+
+
+def send_open_hand_reset(socket, planner: bool, facing: list[float] | None = None, repeats: int = 5):
+    """Send several open-hand reset packets to clear latched hand close commands."""
+    msg = _open_hand_planner_message(facing) if planner else _open_hand_pose_message()
+    for _ in range(max(1, repeats)):
+        socket.send(msg)
+        time.sleep(0.01)
+
+
 def _quat_lerp_normalized(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
     """
     Linear interpolate two quaternions and renormalize. Input shape (4,), xyzw order.
@@ -803,16 +840,46 @@ class PicoReader:
     Background reader that pulls Pico/XRT data as fast as possible and computes dt/FPS.
     """
 
-    def __init__(self, max_queue_size: int = 15):
+    def __init__(
+        self,
+        max_queue_size: int = 15,
+        profile_reader: bool = False,
+        anomaly_dt_ms: float = 50.0,
+        no_data_warn_ms: float = 200.0,
+        read_slow_ms: float = 5.0,
+    ):
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self._started = False
         self._last_t = None
         self._fps_ema = 0.0
         self._last_stamp_ns = None
         self._latest = None
         self._lock = threading.Lock()
+        self._profile_reader = profile_reader
+        self._anomaly_dt_s = anomaly_dt_ms * 1e-3
+        self._no_data_warn_s = no_data_warn_ms * 1e-3
+        self._read_slow_s = read_slow_ms * 1e-3
+        self._last_diag_log = 0.0
+        self._same_stamp_count = 0
+        self._same_stamp_since = None
+        self._same_stamp_warned = False
+        self._no_data_since = None
+        self._no_data_polls = 0
+        self._last_sample_monotonic = None
+
+    def _diag(self, message: str, min_interval_s: float = 1.0):
+        if not self._profile_reader:
+            return
+        now = time.time()
+        if now - self._last_diag_log >= min_interval_s:
+            self._last_diag_log = now
+            print(f"[PicoReader DIAG] {message}", flush=True)
 
     def start(self):
+        if self._started:
+            return
+        self._started = True
         self._thread.start()
 
     def stop(self):
@@ -839,15 +906,95 @@ class PicoReader:
         last_report = time.time()
         while not self._stop.is_set():
             if not xrt.is_body_data_available():
+                now_mono = time.monotonic()
+                if self._no_data_since is None:
+                    self._no_data_since = now_mono
+                    self._no_data_polls = 0
+                self._no_data_polls += 1
+                no_data_s = now_mono - self._no_data_since
+                if no_data_s >= self._no_data_warn_s:
+                    since_sample = (
+                        now_mono - self._last_sample_monotonic
+                        if self._last_sample_monotonic is not None
+                        else float("nan")
+                    )
+                    self._diag(
+                        "no_body_data "
+                        f"duration={no_data_s * 1000.0:.1f}ms "
+                        f"polls={self._no_data_polls} "
+                        f"since_last_sample={since_sample * 1000.0:.1f}ms"
+                    )
                 time.sleep(0.001)
                 continue
+            if self._no_data_since is not None:
+                no_data_s = time.monotonic() - self._no_data_since
+                if no_data_s >= self._no_data_warn_s:
+                    self._diag(
+                        f"body_data_recovered after {no_data_s * 1000.0:.1f}ms "
+                        f"polls={self._no_data_polls}",
+                        min_interval_s=0.0,
+                    )
+                self._no_data_since = None
+                self._no_data_polls = 0
+
             stamp_ns = xrt.get_time_stamp_ns()
             prev_stamp_ns = self._last_stamp_ns
             if prev_stamp_ns is not None and stamp_ns == prev_stamp_ns:
+                now_mono = time.monotonic()
+                if self._same_stamp_since is None:
+                    self._same_stamp_since = now_mono
+                self._same_stamp_count += 1
+                same_stamp_s = now_mono - self._same_stamp_since
+                if same_stamp_s >= self._anomaly_dt_s:
+                    self._same_stamp_warned = True
+                    self._diag(
+                        f"same_timestamp_stall duration={same_stamp_s * 1000.0:.1f}ms "
+                        f"count={self._same_stamp_count} stamp_ns={stamp_ns}"
+                    )
                 time.sleep(0.000001)
                 continue
+            if self._same_stamp_count:
+                if self._same_stamp_warned:
+                    same_stamp_s = (
+                        time.monotonic() - self._same_stamp_since
+                        if self._same_stamp_since is not None
+                        else 0.0
+                    )
+                    self._diag(
+                        f"timestamp_recovered after stall "
+                        f"duration={same_stamp_s * 1000.0:.1f}ms "
+                        f"count={self._same_stamp_count}",
+                        min_interval_s=0.0,
+                    )
+                self._same_stamp_count = 0
+                self._same_stamp_since = None
+                self._same_stamp_warned = False
+
             # Compute device-based dt/fps using timestamp deltas (ns -> s)
             device_dt = ((stamp_ns - prev_stamp_ns) * 1e-9) if prev_stamp_ns is not None else 0.0
+            now_mono_before_read = time.monotonic()
+            pc_dt = (
+                now_mono_before_read - self._last_sample_monotonic
+                if self._last_sample_monotonic is not None
+                else 0.0
+            )
+            if prev_stamp_ns is not None and stamp_ns < prev_stamp_ns:
+                self._diag(
+                    f"timestamp_backward prev={prev_stamp_ns} curr={stamp_ns} "
+                    f"delta={(stamp_ns - prev_stamp_ns) * 1e-6:.2f}ms",
+                    min_interval_s=0.0,
+                )
+            elif device_dt >= self._anomaly_dt_s:
+                self._diag(
+                    f"timestamp_gap device_dt={device_dt * 1000.0:.2f}ms "
+                    f"pc_dt={pc_dt * 1000.0:.2f}ms"
+                )
+            elif pc_dt >= self._anomaly_dt_s:
+                self._diag(
+                    f"pc_gap_without_device_gap pc_dt={pc_dt * 1000.0:.2f}ms "
+                    f"device_dt={device_dt * 1000.0:.2f}ms"
+                )
+
             if device_dt > 0.0:
                 inst = 1.0 / device_dt
                 self._fps_ema = inst if self._fps_ema == 0.0 else (0.9 * self._fps_ema + 0.1 * inst)
@@ -855,7 +1002,15 @@ class PicoReader:
             t_realtime = time.time()
             t_monotonic = time.monotonic()
             try:
+                read_start = time.perf_counter()
                 body_poses = xrt.get_body_joints_pose()
+                read_s = time.perf_counter() - read_start
+                if read_s >= self._read_slow_s:
+                    self._diag(
+                        f"get_body_joints_pose_slow read={read_s * 1000.0:.2f}ms "
+                        f"device_dt={device_dt * 1000.0:.2f}ms "
+                        f"pc_dt={pc_dt * 1000.0:.2f}ms"
+                    )
 
                 sample = {
                     "body_poses_np": np.array(body_poses),
@@ -864,14 +1019,21 @@ class PicoReader:
                     "timestamp_ns": stamp_ns,
                     "dt": device_dt,
                     "fps": self._fps_ema,
+                    "pc_dt": pc_dt,
+                    "body_pose_read_ms": read_s * 1000.0,
                 }
                 with self._lock:
                     self._latest = sample
+                self._last_sample_monotonic = t_monotonic
                 now = time.time()
                 if now - last_report >= 5.0:
-                    print(
-                        f"[PicoReader] dt_ts: {device_dt*1000.0:.2f} ms, fps: {self._fps_ema:.2f}"
-                    )
+                    msg = f"[PicoReader] dt_ts: {device_dt*1000.0:.2f} ms, fps: {self._fps_ema:.2f}"
+                    if self._profile_reader:
+                        msg += (
+                            f", pc_dt: {pc_dt*1000.0:.2f} ms, "
+                            f"read: {read_s*1000.0:.2f} ms"
+                        )
+                    print(msg)
                     last_report = now
             except Exception as e:
                 print(f"[PicoReader] read error: {e}")
@@ -892,6 +1054,10 @@ def _pose_stream_common(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     reader=None,
+    profile_pico_reader: bool = False,
+    pico_anomaly_dt_ms: float = 50.0,
+    pico_no_data_warn_ms: float = 200.0,
+    pico_read_slow_ms: float = 5.0,
 ):
     """Shared pose streaming loop used by run_pico."""
     if reader is None:
@@ -901,7 +1067,13 @@ def _pose_stream_common(
             )
 
         # Create reader and start it
-        reader = PicoReader(max_queue_size=buffer_size)
+        reader = PicoReader(
+            max_queue_size=buffer_size,
+            profile_reader=profile_pico_reader,
+            anomaly_dt_ms=pico_anomaly_dt_ms,
+            no_data_warn_ms=pico_no_data_warn_ms,
+            read_slow_ms=pico_read_slow_ms,
+        )
         reader.start()
 
     # Create 3-point pose processor with visualization settings
@@ -1249,6 +1421,8 @@ class PoseStreamer:
         record_dir: str,
         record_format: str,
         log_prefix: str = "PoseLoop",
+        profile_slow_frames: bool = False,
+        profile_threshold_ms: float = 30.0,
     ):
         self.socket = socket
         self.reader = reader
@@ -1256,6 +1430,12 @@ class PoseStreamer:
         self.target_fps = target_fps
         self.record_dir = record_dir
         self.log_prefix = log_prefix
+        self.profile_slow_frames = profile_slow_frames
+        self.profile_threshold_ms = float(profile_threshold_ms)
+        self._last_slow_profile_log = 0.0
+        self._pose_skip_counts = defaultdict(int)
+        self._last_pico_dt = 0.0
+        self._last_pico_fps = 0.0
 
         # Injected dependencies
         self.reader = reader
@@ -1336,23 +1516,40 @@ class PoseStreamer:
         self.next_target_ns = None
         self.buffer_cleared = True
         self.step = 0
+        self._pose_skip_counts.clear()
+
+    def _record_pose_skip(self, reason: str) -> None:
+        if self.profile_slow_frames:
+            self._pose_skip_counts[reason] += 1
 
     def run_once(self):
         """Execute one iteration of the pose streaming loop."""
+        profile = self.profile_slow_frames
+        t0 = time.perf_counter() if profile else 0.0
+        marks = []
+
+        def mark(name: str):
+            if profile:
+                marks.append((name, time.perf_counter()))
+
         sample = self.reader.get_latest()
+        mark("get_latest")
 
         if sample is None:
+            self._record_pose_skip("no_sample")
             time.sleep(0.005)
             return
 
         latest_data = compute_from_body_poses(
             self.parent_indices, self.device, sample["body_poses_np"]
         )
+        mark("compute_body")
         left_menu_button, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(
             self.reader
         )
         # Get A and B button states for data collection control
         a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
+        mark("controller_inputs")
 
         # Data collection toggle logic (edge-triggered)
         # Left grip + A = toggle_data_collection
@@ -1374,6 +1571,7 @@ class PoseStreamer:
             right_trigger,
             right_grip,
         )
+        mark("hand_ik")
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
         ).astype(np.float32)
@@ -1383,6 +1581,7 @@ class PoseStreamer:
         body_quat_np = (
             latest_data["global_orient_quat"].detach().cpu().numpy()[0].astype(np.float32)
         )
+        mark("tensor_to_numpy")
         curr_stamp_ns = int(sample.get("timestamp_ns", 0))
         step_ns = int(1e9 / max(1, self.target_fps))
         if self.prev_stamp_ns is None:
@@ -1391,14 +1590,26 @@ class PoseStreamer:
             self.prev_smpl_joints_np = smpl_joints_np
             self.prev_body_quat_np = body_quat_np
             self.next_target_ns = curr_stamp_ns
+            self._record_pose_skip("init_timestamp")
             return
         if curr_stamp_ns <= self.prev_stamp_ns:
+            self._record_pose_skip("stale_timestamp")
+            # Avoid a tight busy-wait loop on the same Pico sample. Without this
+            # tiny yield, the manager thread can repeatedly reacquire the GIL and
+            # make it harder for the PicoReader background thread to publish the
+            # next timestamp, which shows up as PoseLoop FPS drops even though
+            # PicoReader itself is nominally running at 70+ Hz.
+            time.sleep(0.001)
             return
         if self.next_target_ns is None:
             self.next_target_ns = self.prev_stamp_ns + step_ns
         if self.next_target_ns < self.prev_stamp_ns:
             self.next_target_ns = self.prev_stamp_ns
         if self.next_target_ns > curr_stamp_ns:
+            self._record_pose_skip("wait_target_timestamp")
+            # The latest Pico sample has not advanced far enough for the next
+            # 50 Hz output timestamp yet. Yield briefly instead of spinning.
+            time.sleep(0.001)
             return
         denom = float(curr_stamp_ns - self.prev_stamp_ns)
         alpha = float(self.next_target_ns - self.prev_stamp_ns) / denom if denom > 0.0 else 1.0
@@ -1413,6 +1624,7 @@ class PoseStreamer:
         use_body_quat = _quat_lerp_normalized(self.prev_body_quat_np, body_quat_np, alpha).astype(
             np.float32
         )
+        mark("interp")
         N = len(self.frame_buffer["frame_index"])
 
         ##### From @Jiefeng for directly setting the joint position ######
@@ -1474,6 +1686,7 @@ class PoseStreamer:
         joint_pos[G1_R_WRIST_ROLL_IDX] = g1_r_wrist_roll[0]
         joint_pos[G1_R_WRIST_PITCH_IDX] = g1_r_wrist_pitch[0]
         joint_pos[G1_R_WRIST_YAW_IDX] = g1_r_wrist_yaw[0]
+        mark("wrist_retarget")
 
         # Process SMPL pose to get calibrated 3-point VR pose and update visualization
         # Pass SMPL local joints for optional body visualization in the VR3Pt viewer
@@ -1485,6 +1698,7 @@ class PoseStreamer:
         vr_3pt_pose = self.three_point.process_smpl_pose(
             sample["body_poses_np"], smpl_joints_local=smpl_joints_for_vis
         )
+        mark("process_smpl_pose")
         ##### From @Jiefeng for directly setting the joint position ######
 
         self.frame_buffer["smpl_pose"].append(use_pose)
@@ -1494,6 +1708,8 @@ class PoseStreamer:
         self.frame_buffer["joint_pos"].append(joint_pos)
         pico_dt = float(sample.get("dt", 0.0))
         pico_fps = float(sample.get("fps", 0.0))
+        self._last_pico_dt = pico_dt
+        self._last_pico_fps = pico_fps
         N = len(self.frame_buffer["frame_index"])
 
         # Wait for buffer to be completely filled before sending first message after clearing
@@ -1539,12 +1755,16 @@ class PoseStreamer:
             }
 
             packed_message = pack_pose_message(numpy_data, topic="pose")
+            mark("pack")
             self.socket.send(packed_message)
+            mark("send")
 
             if self.record_dir:
                 out_path = os.path.join(self.record_dir, f"pose_{self.record_idx:06d}.npz")
                 np.savez_compressed(out_path, **numpy_data)
                 self.record_idx += 1
+        elif profile:
+            mark("no_send")
 
         self.step += 1
         self.next_target_ns += step_ns
@@ -1557,17 +1777,52 @@ class PoseStreamer:
         if current_time - self.last_fps_report >= 5.0:
             fps = self.fps_counter / (current_time - self.last_fps_report)
             print(f"[{self.log_prefix}] FPS: {fps:.2f}, Step: {self.step}")
+            if self.profile_slow_frames and fps < 0.85 * float(self.target_fps):
+                skip_summary = ", ".join(
+                    f"{name}={count}" for name, count in sorted(self._pose_skip_counts.items())
+                )
+                if not skip_summary:
+                    skip_summary = "none"
+                print(
+                    f"[{self.log_prefix} DROP] fps={fps:.2f} target={self.target_fps} "
+                    f"pico_dt={self._last_pico_dt * 1000.0:.2f}ms "
+                    f"pico_fps={self._last_pico_fps:.2f} "
+                    f"skips={{ {skip_summary} }}"
+                )
             self.fps_counter = 0
             self.last_fps_report = current_time
+            self._pose_skip_counts.clear()
         elapsed = time.time() - self.frame_start
         if elapsed < self.frame_time:
             time.sleep(self.frame_time - elapsed)
         self.frame_start = time.time()
+        if profile:
+            t_end = time.perf_counter()
+            total_ms = (t_end - t0) * 1000.0
+            now = time.time()
+            if total_ms >= self.profile_threshold_ms and now - self._last_slow_profile_log >= 1.0:
+                self._last_slow_profile_log = now
+                prev = t0
+                parts = []
+                for name, ts in marks:
+                    parts.append(f"{name}={(ts - prev) * 1000.0:.2f}ms")
+                    prev = ts
+                parts.append(f"tail={(t_end - prev) * 1000.0:.2f}ms")
+                print(
+                    f"[{self.log_prefix} SLOW] total={total_ms:.2f}ms "
+                    f"threshold={self.profile_threshold_ms:.1f}ms step={self.step} "
+                    + ", ".join(parts)
+                )
 
 
 def _init_input_source(
     input_source: str,
     buffer_size: int,
+    profile_pico_reader: bool = False,
+    pico_anomaly_dt_ms: float = 50.0,
+    pico_no_data_warn_ms: float = 200.0,
+    pico_read_slow_ms: float = 5.0,
+    defer_xrt_reader_start: bool = False,
 ) -> "PicoReader | input_readers.IsaacTeleopReader":
     """Create, start, and wait for readiness of the requested teleop input source."""
     if input_source == "isaac-teleop":
@@ -1591,8 +1846,15 @@ def _init_input_source(
         print("waiting for body data...")
         time.sleep(1)
 
-    reader = PicoReader(max_queue_size=buffer_size)
-    reader.start()
+    reader = PicoReader(
+        max_queue_size=buffer_size,
+        profile_reader=profile_pico_reader,
+        anomaly_dt_ms=pico_anomaly_dt_ms,
+        no_data_warn_ms=pico_no_data_warn_ms,
+        read_slow_ms=pico_read_slow_ms,
+    )
+    if not defer_xrt_reader_start:
+        reader.start()
     return reader
 
 
@@ -1609,9 +1871,23 @@ def run_pico(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    profile_pose_loop: bool = False,
+    profile_pose_threshold_ms: float = 30.0,
+    profile_pico_reader: bool = False,
+    pico_anomaly_dt_ms: float = 50.0,
+    pico_no_data_warn_ms: float = 200.0,
+    pico_read_slow_ms: float = 5.0,
 ):
     """Run body tracking with real-time visualization and ZMQ streaming."""
-    reader = _init_input_source(input_source, buffer_size)
+    reader = _init_input_source(
+        input_source,
+        buffer_size,
+        profile_pico_reader=profile_pico_reader,
+        pico_anomaly_dt_ms=pico_anomaly_dt_ms,
+        pico_no_data_warn_ms=pico_no_data_warn_ms,
+        pico_read_slow_ms=pico_read_slow_ms,
+        defer_xrt_reader_start=True,
+    )
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
@@ -1639,6 +1915,10 @@ def run_pico(
             enable_waist_tracking=enable_waist_tracking,
             enable_smpl_vis=enable_smpl_vis,
             reader=reader,
+            profile_pico_reader=profile_pico_reader,
+            pico_anomaly_dt_ms=pico_anomaly_dt_ms,
+            pico_no_data_warn_ms=pico_no_data_warn_ms,
+            pico_read_slow_ms=pico_read_slow_ms,
         )
     finally:
         socket.close()
@@ -1912,6 +2192,13 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    profile_pose_loop: bool = False,
+    profile_pose_threshold_ms: float = 30.0,
+    profile_pico_reader: bool = False,
+    pico_anomaly_dt_ms: float = 50.0,
+    pico_no_data_warn_ms: float = 200.0,
+    pico_read_slow_ms: float = 5.0,
+    manager_idle_hz: int = 50,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1919,7 +2206,14 @@ def run_pico_manager(
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
     """
-    reader = _init_input_source(input_source, buffer_size)
+    reader = _init_input_source(
+        input_source,
+        buffer_size,
+        profile_pico_reader=profile_pico_reader,
+        pico_anomaly_dt_ms=pico_anomaly_dt_ms,
+        pico_no_data_warn_ms=pico_no_data_warn_ms,
+        pico_read_slow_ms=pico_read_slow_ms,
+    )
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -1953,6 +2247,8 @@ def run_pico_manager(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix="PoseLoop",
+        profile_slow_frames=profile_pose_loop,
+        profile_threshold_ms=profile_pose_threshold_ms,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -1962,6 +2258,13 @@ def run_pico_manager(
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
     )
+
+    if isinstance(reader, PicoReader):
+        print("[Manager] Starting PicoReader after manager initialization")
+        reader.start()
+        while reader.get_latest() is None:
+            print("[Manager] waiting for first PicoReader sample...")
+            time.sleep(0.1)
 
     # State machine diagram:
     #
@@ -1980,6 +2283,7 @@ def run_pico_manager(
     #
     print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
     current_mode = StreamMode.OFF
+    idle_sleep_s = 1.0 / max(1, manager_idle_hz)
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
@@ -2071,6 +2375,10 @@ def run_pico_manager(
             if new_mode != current_mode:
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
+                    # Clear any latched closed hand command before leaving streamed
+                    # pose mode. Without this, the deploy loop keeps replaying the
+                    # previous left/right hand buffer until a new hand packet arrives.
+                    send_open_hand_reset(socket, planner=False)
 
                 # Track parent when entering VR_3PT
                 if new_mode == StreamMode.PLANNER_VR_3PT:
@@ -2117,8 +2425,16 @@ def run_pico_manager(
                     or new_mode == StreamMode.PLANNER_VR_3PT
                 ):
                     socket.send(build_command_message(start=True, stop=False, planner=True))
+                    send_open_hand_reset(
+                        socket,
+                        planner=True,
+                        facing=planner_streamer.yaw_accumulator.heading,
+                    )
                 elif new_mode == StreamMode.POSE:
                     socket.send(build_command_message(start=True, stop=False, planner=False))
+                    send_open_hand_reset(socket, planner=False)
+                elif new_mode == StreamMode.POSE_PAUSE:
+                    send_open_hand_reset(socket, planner=False)
 
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
@@ -2145,6 +2461,9 @@ def run_pico_manager(
             prev_by_pressed = by_pressed
             prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
+
+            if current_mode == StreamMode.OFF:
+                time.sleep(idle_sleep_s)
 
     except KeyboardInterrupt:
         print("\nStopping manager...")
@@ -2251,6 +2570,49 @@ if __name__ == "__main__":
             "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
         ),
     )
+    parser.add_argument(
+        "--profile-pose-loop",
+        action="store_true",
+        help="Print PoseLoop stage timings only for slow frames (disabled by default)",
+    )
+    parser.add_argument(
+        "--profile-pose-threshold-ms",
+        type=float,
+        default=30.0,
+        help="Slow-frame threshold for --profile-pose-loop in milliseconds (default: 30)",
+    )
+    parser.add_argument(
+        "--profile-pico-reader",
+        action="store_true",
+        help=(
+            "Print PicoReader diagnostics for XRoboToolkit body-data stalls, "
+            "timestamp gaps, repeated timestamps, and slow SDK reads"
+        ),
+    )
+    parser.add_argument(
+        "--pico-anomaly-dt-ms",
+        type=float,
+        default=50.0,
+        help="Timestamp gap threshold for --profile-pico-reader (default: 50ms)",
+    )
+    parser.add_argument(
+        "--pico-no-data-warn-ms",
+        type=float,
+        default=200.0,
+        help="No-body-data duration threshold for --profile-pico-reader (default: 200ms)",
+    )
+    parser.add_argument(
+        "--pico-read-slow-ms",
+        type=float,
+        default=5.0,
+        help="Slow xrt.get_body_joints_pose() threshold for --profile-pico-reader (default: 5ms)",
+    )
+    parser.add_argument(
+        "--manager-idle-hz",
+        type=int,
+        default=50,
+        help="Polling rate while manager is OFF before policy start (default: 50Hz)",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2292,6 +2654,13 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            profile_pose_loop=args.profile_pose_loop,
+            profile_pose_threshold_ms=args.profile_pose_threshold_ms,
+            profile_pico_reader=args.profile_pico_reader,
+            pico_anomaly_dt_ms=args.pico_anomaly_dt_ms,
+            pico_no_data_warn_ms=args.pico_no_data_warn_ms,
+            pico_read_slow_ms=args.pico_read_slow_ms,
+            manager_idle_hz=args.manager_idle_hz,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -2308,4 +2677,10 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            profile_pose_loop=args.profile_pose_loop,
+            profile_pose_threshold_ms=args.profile_pose_threshold_ms,
+            profile_pico_reader=args.profile_pico_reader,
+            pico_anomaly_dt_ms=args.pico_anomaly_dt_ms,
+            pico_no_data_warn_ms=args.pico_no_data_warn_ms,
+            pico_read_slow_ms=args.pico_read_slow_ms,
         )
