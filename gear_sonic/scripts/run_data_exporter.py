@@ -172,6 +172,7 @@ class TimingThresholdMonitor:
         self.last_failure_time = 0
         self.time_delta = time_delta
         self.raise_exception = raise_exception
+        self.last_report_time = 0
 
     def reset(self):
         self.failure_count = 0
@@ -179,11 +180,23 @@ class TimingThresholdMonitor:
 
     def log_time_delta(self, time_delta_sec: float):
         time_delta = abs(time_delta_sec)
+        now = time.monotonic()
+
+        # Reset a stale failure burst before testing the current sample.  The old
+        # implementation checked ``failure_count >= max_failures`` first, so once
+        # the threshold was crossed it kept printing forever, even for healthy
+        # sub-millisecond deltas.
+        if self.last_failure_time and now - self.last_failure_time > self.reset_timeout_sec:
+            self.reset()
+
         if time_delta > self.time_delta:
             self.failure_count += 1
-            self.last_failure_time = time.monotonic()
+            self.last_failure_time = now
+        else:
+            return
 
-        if self.is_threshold_exceeded():
+        if self.is_threshold_exceeded() and now - self.last_report_time >= 1.0:
+            self.last_report_time = now
             print(
                 f"Time delta exception: {self.failure_count} failures in "
                 f"{self.reset_timeout_sec} seconds, time delta: {time_delta}"
@@ -192,10 +205,11 @@ class TimingThresholdMonitor:
                 raise TimeDeltaException(self.failure_count, self.reset_timeout_sec)
 
     def is_threshold_exceeded(self):
-        if self.failure_count >= self.max_failures:
-            return True
         if time.monotonic() - self.last_failure_time > self.reset_timeout_sec:
             self.reset()
+            return False
+        if self.failure_count >= self.max_failures:
+            return True
         return False
 
 
@@ -242,6 +256,9 @@ class GrootDataCollector:
         self.obs_act_buffer = deque(maxlen=100)
         self.latest_image_msg = None
         self.latest_proprio_msg = None
+        self.proprio_buffer = deque(maxlen=300)
+        self.max_proprio_image_time_diff_sec = 0.20
+        self._last_sync_log_time = 0.0
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
 
@@ -300,10 +317,60 @@ class GrootDataCollector:
         if msg is None:
             return
 
+        receive_time = time.time()
         if msg.get("ros_timestamp", 0.0) == 0.0:
-            msg["ros_timestamp"] = time.time()
+            msg["ros_timestamp"] = receive_time
+        msg["_pc_receive_time"] = receive_time
 
         self.latest_proprio_msg = msg
+        self.proprio_buffer.append(msg)
+
+    def _get_current_image_timestamp(self) -> float | None:
+        """Return the current image capture timestamp in the PC timebase."""
+        if self.latest_image_msg is None:
+            return None
+
+        timestamps = self.latest_image_msg.get("timestamps", {})
+        if not timestamps:
+            return None
+
+        if "ego_view" in timestamps:
+            return float(timestamps["ego_view"])
+        return float(next(iter(timestamps.values())))
+
+    def _select_proprio_for_current_image(self) -> dict | None:
+        """Select the proprio sample closest to the current image timestamp.
+
+        The C++ ZMQ state packet does not currently publish the original
+        hardware/StateLogger timestamp in this non-ROS path.  We therefore use
+        the PC receive timestamp as a low-risk approximation and align the
+        recorded proprio/action to the image capture timestamp.
+        """
+        if self.latest_proprio_msg is None:
+            return None
+
+        image_ts = self._get_current_image_timestamp()
+        if image_ts is None or not self.proprio_buffer:
+            return self.latest_proprio_msg
+
+        selected = min(
+            self.proprio_buffer,
+            key=lambda msg: abs(float(msg.get("_pc_receive_time", msg["ros_timestamp"])) - image_ts),
+        )
+        selected_ts = float(selected.get("_pc_receive_time", selected["ros_timestamp"]))
+        dt = selected_ts - image_ts
+
+        now = time.time()
+        if now - self._last_sync_log_time >= 1.0:
+            self._last_sync_log_time = now
+            print(
+                f"[Sync] image↔proprio dt={dt * 1000:.1f}ms "
+                f"(buffer={len(self.proprio_buffer)})"
+            )
+        elif abs(dt) > self.max_proprio_image_time_diff_sec:
+            print(f"[Sync] Warning: nearest proprio/image dt={dt * 1000:.1f}ms")
+
+        return selected
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
@@ -574,7 +641,9 @@ class GrootDataCollector:
     def _add_data_frame_sonic(self, t_start: float) -> bool:
         """Build one data frame in Sonic CPP + SMPL mode."""
         assert self.latest_proprio_msg is not None
-        proprio = self.latest_proprio_msg
+        proprio = self._select_proprio_for_current_image()
+        if proprio is None:
+            return False
 
         whole_q = self.robot_model.get_configuration_from_actuated_joints(
             body_actuated_joint_values=proprio["body_q"],
