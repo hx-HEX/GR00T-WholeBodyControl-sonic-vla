@@ -532,9 +532,28 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
             self._last_new_message_time = current_time
 
             if self.idx % 10 == 0:
+                debug_timestamps = self._latest_message.get("debug_timestamps", {})
                 for image_key, image_time in self._latest_message["timestamps"].items():
-                    image_latency = (time.time() - image_time) * 1000
-                    print(f"Image latency for {image_key}: {image_latency:.2f} ms")
+                    receive_time = time.time()
+                    image_latency = (receive_time - image_time) * 1000
+                    debug_ts = debug_timestamps.get(image_key, {})
+                    if debug_ts:
+                        capture_time = float(debug_ts.get("capture_time", image_time))
+                        read_time = float(debug_ts.get("read_time", capture_time))
+                        publish_time = float(debug_ts.get("publish_time", read_time))
+                        capture_to_read = (read_time - capture_time) * 1000
+                        read_to_publish = (publish_time - read_time) * 1000
+                        publish_to_client = (receive_time - publish_time) * 1000
+                        domain = debug_ts.get("timestamp_domain", "unknown")
+                        print(
+                            f"Image latency for {image_key}: total={image_latency:.2f} ms "
+                            f"(capture→read={capture_to_read:.2f}, "
+                            f"read→publish={read_to_publish:.2f}, "
+                            f"publish→client={publish_to_client:.2f}, "
+                            f"domain={domain})"
+                        )
+                    else:
+                        print(f"Image latency for {image_key}: {image_latency:.2f} ms")
 
             self._msg_received_time = time.time()
             self._avg_time_per_frame.append(self._msg_received_time - self._start_time)
