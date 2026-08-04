@@ -121,6 +121,21 @@ bool ConvertONNXToTRT(
 {
     if ( !FileExists( onnxModelPath ) )
     {
+        // Some deployment packages ship pre-built TensorRT engines without the
+        // original ONNX files.  In that case, fall back to the cache filename
+        // that would have been generated from the ONNX path.
+        const auto filenamePos = onnxModelPath.find_last_of( '/' ) + 1;
+        const auto onnxDir = onnxModelPath.substr(0, filenamePos);
+        const auto dotPos = onnxModelPath.find_last_of( '.' );
+        trtFile = onnxDir + prefix + onnxModelPath.substr( filenamePos, dotPos - filenamePos );
+        trtFile += ".trt";
+
+        if ( FileExists( trtFile ) )
+        {
+            LOG_INFO( "ONNX file missing at " + onnxModelPath + "; using cached TensorRT engine: " + trtFile );
+            return true;
+        }
+
         LOG_ERROR( "Cannot find ONNX mode at path: " + onnxModelPath );
         return false;
     }
