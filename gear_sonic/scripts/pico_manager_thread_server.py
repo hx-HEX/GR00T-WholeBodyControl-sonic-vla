@@ -947,6 +947,7 @@ class PicoReader:
         anomaly_dt_ms: float = 50.0,
         no_data_warn_ms: float = 200.0,
         read_slow_ms: float = 5.0,
+        timestamp_source: str = "xrt",
     ):
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -954,12 +955,19 @@ class PicoReader:
         self._last_t = None
         self._fps_ema = 0.0
         self._last_stamp_ns = None
+        self._last_effective_stamp_ns = None
         self._latest = None
         self._lock = threading.Lock()
         self._profile_reader = profile_reader
         self._anomaly_dt_s = anomaly_dt_ms * 1e-3
         self._no_data_warn_s = no_data_warn_ms * 1e-3
         self._read_slow_s = read_slow_ms * 1e-3
+        self._timestamp_source = timestamp_source
+        if self._timestamp_source not in {"xrt", "pc", "auto"}:
+            raise ValueError("timestamp_source must be one of: xrt, pc, auto")
+        self._pc_timestamp_interval_s = 1.0 / 90.0
+        self._pc_stamp_base_mono = time.monotonic()
+        self._pc_stamp_base_ns = time.time_ns()
         self._last_diag_log = 0.0
         self._same_stamp_count = 0
         self._same_stamp_since = None
@@ -1063,9 +1071,17 @@ class PicoReader:
         pass
 
     def get_timestamp_ns(self) -> int:
+        with self._lock:
+            if self._latest is not None:
+                return int(self._latest.get("timestamp_ns", 0))
         if xrt is None:
             return 0
-        return int(xrt.get_time_stamp_ns())
+        if self._timestamp_source == "xrt":
+            return int(xrt.get_time_stamp_ns())
+        return self._pc_time_ns(time.monotonic())
+
+    def _pc_time_ns(self, now_mono: float) -> int:
+        return self._pc_stamp_base_ns + int((now_mono - self._pc_stamp_base_mono) * 1e9)
 
     def _run(self):
         last_report = time.time()
@@ -1103,8 +1119,15 @@ class PicoReader:
                 self._no_data_since = None
                 self._no_data_polls = 0
 
-            stamp_ns = xrt.get_time_stamp_ns()
+            stamp_ns = int(xrt.get_time_stamp_ns())
             prev_stamp_ns = self._last_stamp_ns
+            now_mono_before_read = time.monotonic()
+            pc_dt = (
+                now_mono_before_read - self._last_sample_monotonic
+                if self._last_sample_monotonic is not None
+                else 0.0
+            )
+            use_pc_timestamp = self._timestamp_source == "pc"
             if prev_stamp_ns is not None and stamp_ns == prev_stamp_ns:
                 now_mono = time.monotonic()
                 if self._same_stamp_since is None:
@@ -1118,10 +1141,19 @@ class PicoReader:
                         f"count={self._same_stamp_count} stamp_ns={stamp_ns}",
                         include_xrt_snapshot=True,
                     )
-                time.sleep(0.000001)
-                continue
+                    if self._timestamp_source == "auto":
+                        use_pc_timestamp = True
+                        self._diag(
+                            "xrt_timestamp_stalled_using_pc_time "
+                            f"duration={same_stamp_s * 1000.0:.1f}ms "
+                            f"pc_dt={pc_dt * 1000.0:.2f}ms",
+                            include_xrt_snapshot=True,
+                        )
+                if not use_pc_timestamp:
+                    time.sleep(0.001)
+                    continue
             if self._same_stamp_count:
-                if self._same_stamp_warned:
+                if stamp_ns != prev_stamp_ns and self._same_stamp_warned:
                     same_stamp_s = (
                         time.monotonic() - self._same_stamp_since
                         if self._same_stamp_since is not None
@@ -1133,16 +1165,31 @@ class PicoReader:
                         f"count={self._same_stamp_count}",
                         min_interval_s=0.0,
                     )
-                self._same_stamp_count = 0
-                self._same_stamp_since = None
-                self._same_stamp_warned = False
+                if stamp_ns != prev_stamp_ns:
+                    self._same_stamp_count = 0
+                    self._same_stamp_since = None
+                    self._same_stamp_warned = False
 
             # Compute device-based dt/fps using timestamp deltas (ns -> s)
             device_dt = ((stamp_ns - prev_stamp_ns) * 1e-9) if prev_stamp_ns is not None else 0.0
-            now_mono_before_read = time.monotonic()
-            pc_dt = (
-                now_mono_before_read - self._last_sample_monotonic
-                if self._last_sample_monotonic is not None
+            if use_pc_timestamp and pc_dt > 0.0 and pc_dt < self._pc_timestamp_interval_s:
+                time.sleep(max(0.0, self._pc_timestamp_interval_s - pc_dt))
+                continue
+            timestamp_source_used = "pc" if self._timestamp_source == "pc" else "xrt"
+            effective_stamp_ns = stamp_ns
+            if use_pc_timestamp:
+                now_mono_before_read = time.monotonic()
+                pc_dt = (
+                    now_mono_before_read - self._last_sample_monotonic
+                    if self._last_sample_monotonic is not None
+                    else 0.0
+                )
+                effective_stamp_ns = self._pc_time_ns(now_mono_before_read)
+                timestamp_source_used = "pc" if self._timestamp_source == "pc" else "auto_pc"
+            prev_effective_stamp_ns = self._last_effective_stamp_ns
+            effective_dt = (
+                (effective_stamp_ns - prev_effective_stamp_ns) * 1e-9
+                if prev_effective_stamp_ns is not None
                 else 0.0
             )
             if prev_stamp_ns is not None and stamp_ns < prev_stamp_ns:
@@ -1165,10 +1212,12 @@ class PicoReader:
                     include_xrt_snapshot=True,
                 )
 
-            if device_dt > 0.0:
-                inst = 1.0 / device_dt
+            fps_dt = effective_dt if effective_dt > 0.0 else device_dt
+            if fps_dt > 0.0:
+                inst = 1.0 / fps_dt
                 self._fps_ema = inst if self._fps_ema == 0.0 else (0.9 * self._fps_ema + 0.1 * inst)
             self._last_stamp_ns = stamp_ns
+            self._last_effective_stamp_ns = effective_stamp_ns
             t_realtime = time.time()
             t_monotonic = time.monotonic()
             try:
@@ -1187,8 +1236,11 @@ class PicoReader:
                     "body_poses_np": np.array(body_poses),
                     "timestamp_realtime": t_realtime,
                     "timestamp_monotonic": t_monotonic,
-                    "timestamp_ns": stamp_ns,
-                    "dt": device_dt,
+                    "timestamp_ns": effective_stamp_ns,
+                    "xrt_timestamp_ns": stamp_ns,
+                    "timestamp_source": timestamp_source_used,
+                    "dt": fps_dt,
+                    "xrt_dt": device_dt,
                     "fps": self._fps_ema,
                     "pc_dt": pc_dt,
                     "body_pose_read_ms": read_s * 1000.0,
@@ -1198,11 +1250,16 @@ class PicoReader:
                 self._last_sample_monotonic = t_monotonic
                 now = time.time()
                 if now - last_report >= 5.0:
-                    msg = f"[PicoReader] dt_ts: {device_dt*1000.0:.2f} ms, fps: {self._fps_ema:.2f}"
+                    msg = (
+                        f"[PicoReader] dt_ts: {fps_dt*1000.0:.2f} ms, "
+                        f"fps: {self._fps_ema:.2f}"
+                    )
                     if self._profile_reader:
                         msg += (
                             f", pc_dt: {pc_dt*1000.0:.2f} ms, "
-                            f"read: {read_s*1000.0:.2f} ms"
+                            f"read: {read_s*1000.0:.2f} ms, "
+                            f"ts_src: {timestamp_source_used}, "
+                            f"xrt_dt: {device_dt*1000.0:.2f} ms"
                         )
                     print(msg)
                     last_report = now
@@ -1229,6 +1286,7 @@ def _pose_stream_common(
     pico_anomaly_dt_ms: float = 50.0,
     pico_no_data_warn_ms: float = 200.0,
     pico_read_slow_ms: float = 5.0,
+    pico_timestamp_source: str = "xrt",
 ):
     """Shared pose streaming loop used by run_pico."""
     if reader is None:
@@ -1244,6 +1302,7 @@ def _pose_stream_common(
             anomaly_dt_ms=pico_anomaly_dt_ms,
             no_data_warn_ms=pico_no_data_warn_ms,
             read_slow_ms=pico_read_slow_ms,
+            timestamp_source=pico_timestamp_source,
         )
         reader.start()
 
@@ -1993,6 +2052,7 @@ def _init_input_source(
     pico_anomaly_dt_ms: float = 50.0,
     pico_no_data_warn_ms: float = 200.0,
     pico_read_slow_ms: float = 5.0,
+    pico_timestamp_source: str = "xrt",
     defer_xrt_reader_start: bool = False,
 ) -> "PicoReader | input_readers.IsaacTeleopReader":
     """Create, start, and wait for readiness of the requested teleop input source."""
@@ -2023,6 +2083,7 @@ def _init_input_source(
         anomaly_dt_ms=pico_anomaly_dt_ms,
         no_data_warn_ms=pico_no_data_warn_ms,
         read_slow_ms=pico_read_slow_ms,
+        timestamp_source=pico_timestamp_source,
     )
     if not defer_xrt_reader_start:
         reader.start()
@@ -2048,6 +2109,7 @@ def run_pico(
     pico_anomaly_dt_ms: float = 50.0,
     pico_no_data_warn_ms: float = 200.0,
     pico_read_slow_ms: float = 5.0,
+    pico_timestamp_source: str = "xrt",
 ):
     """Run body tracking with real-time visualization and ZMQ streaming."""
     reader = _init_input_source(
@@ -2057,6 +2119,7 @@ def run_pico(
         pico_anomaly_dt_ms=pico_anomaly_dt_ms,
         pico_no_data_warn_ms=pico_no_data_warn_ms,
         pico_read_slow_ms=pico_read_slow_ms,
+        pico_timestamp_source=pico_timestamp_source,
         defer_xrt_reader_start=True,
     )
     context = zmq.Context()
@@ -2090,6 +2153,7 @@ def run_pico(
             pico_anomaly_dt_ms=pico_anomaly_dt_ms,
             pico_no_data_warn_ms=pico_no_data_warn_ms,
             pico_read_slow_ms=pico_read_slow_ms,
+            pico_timestamp_source=pico_timestamp_source,
         )
     finally:
         socket.close()
@@ -2369,6 +2433,7 @@ def run_pico_manager(
     pico_anomaly_dt_ms: float = 50.0,
     pico_no_data_warn_ms: float = 200.0,
     pico_read_slow_ms: float = 5.0,
+    pico_timestamp_source: str = "xrt",
     manager_idle_hz: int = 50,
 ):
     """
@@ -2384,6 +2449,7 @@ def run_pico_manager(
         pico_anomaly_dt_ms=pico_anomaly_dt_ms,
         pico_no_data_warn_ms=pico_no_data_warn_ms,
         pico_read_slow_ms=pico_read_slow_ms,
+        pico_timestamp_source=pico_timestamp_source,
     )
 
     context = zmq.Context()
@@ -2779,6 +2845,16 @@ if __name__ == "__main__":
         help="Slow xrt.get_body_joints_pose() threshold for --profile-pico-reader (default: 5ms)",
     )
     parser.add_argument(
+        "--pico-timestamp-source",
+        choices=("xrt", "pc", "auto"),
+        default="xrt",
+        help=(
+            "Timestamp source for Pico samples: xrt=original XRoboToolkit timestamp; "
+            "pc=PC monotonic time; auto=use XRT normally, fallback to PC time when XRT stalls "
+            "(default: xrt)"
+        ),
+    )
+    parser.add_argument(
         "--manager-idle-hz",
         type=int,
         default=50,
@@ -2831,6 +2907,7 @@ if __name__ == "__main__":
             pico_anomaly_dt_ms=args.pico_anomaly_dt_ms,
             pico_no_data_warn_ms=args.pico_no_data_warn_ms,
             pico_read_slow_ms=args.pico_read_slow_ms,
+            pico_timestamp_source=args.pico_timestamp_source,
             manager_idle_hz=args.manager_idle_hz,
         )
     else:
@@ -2854,4 +2931,5 @@ if __name__ == "__main__":
             pico_anomaly_dt_ms=args.pico_anomaly_dt_ms,
             pico_no_data_warn_ms=args.pico_no_data_warn_ms,
             pico_read_slow_ms=args.pico_read_slow_ms,
+            pico_timestamp_source=args.pico_timestamp_source,
         )

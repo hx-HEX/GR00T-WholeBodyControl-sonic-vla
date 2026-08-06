@@ -33,6 +33,7 @@ PATTERNS = {
     "pico_periodic": re.compile(
         rf"\[PicoReader\] dt_ts: ({FLOAT}) ms, fps: ({FLOAT})(?:, pc_dt: ({FLOAT}) ms, read: ({FLOAT}) ms)?"
     ),
+    "pico_ts_src": re.compile(r"ts_src: ([a-zA-Z0-9_]+)"),
     "pose_drop": re.compile(
         rf"\[PoseLoop DROP\] fps=({FLOAT}) target=({FLOAT}).*skips=\{{([^}}]*)\}}"
     ),
@@ -103,6 +104,7 @@ def parse_log(path: Path) -> dict[str, Metric | int | dict[str, int]]:
         "pose_skip_counts": {},
         "xrt_counts": {},
         "zmq_counts": {},
+        "pico_ts_source_counts": {},
         "lines": 0,
     }
 
@@ -112,6 +114,8 @@ def parse_log(path: Path) -> dict[str, Metric | int | dict[str, int]]:
     assert isinstance(xrt_counts, dict)
     zmq_counts = metrics["zmq_counts"]
     assert isinstance(zmq_counts, dict)
+    pico_ts_source_counts = metrics["pico_ts_source_counts"]
+    assert isinstance(pico_ts_source_counts, dict)
 
     with path.open("r", errors="replace") as f:
         for line in f:
@@ -166,6 +170,9 @@ def parse_log(path: Path) -> dict[str, Metric | int | dict[str, int]]:
                 cast(Metric, metrics["pico_fps"]).add(float(m.group(2)))
                 if m.group(4) is not None:
                     cast(Metric, metrics["pico_read_ms"]).add(float(m.group(4)))
+                if src_m := PATTERNS["pico_ts_src"].search(line):
+                    src = src_m.group(1)
+                    pico_ts_source_counts[src] = pico_ts_source_counts.get(src, 0) + 1
                 continue
             if m := PATTERNS["pose_drop"].search(line):
                 cast(Metric, metrics["pose_drop_fps"]).add(float(m.group(1)))
@@ -278,6 +285,14 @@ def main() -> int:
                 f"{k}={v}" for k, v in sorted(zmq_counts.items(), key=lambda kv: kv[0])
             )
             print(f"zmq_counts: {top}")
+
+        pico_ts_source_counts = metrics["pico_ts_source_counts"]
+        assert isinstance(pico_ts_source_counts, dict)
+        if pico_ts_source_counts:
+            top = ", ".join(
+                f"{k}={v}" for k, v in sorted(pico_ts_source_counts.items(), key=lambda kv: kv[0])
+            )
+            print(f"pico_ts_source_counts: {top}")
 
     print("\nInterpretation:")
     print("- pico_device_gap_ms/stall_ms high: XRoboToolkit/PICO source is not producing fresh timestamps.")
