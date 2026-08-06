@@ -53,10 +53,21 @@ echo "[log_stream_debug] log: ${log_file}"
 echo "[log_stream_debug] command saved: ${cmd_file}"
 
 set +e
-PYTHONUNBUFFERED=1 stdbuf -oL -eL "$@" 2>&1 \
-  | awk '{ print strftime("[%F %T]"), $0; fflush(); }' \
-  | tee -a "${log_file}"
-status=${PIPESTATUS[0]}
+if command -v script >/dev/null 2>&1; then
+  cmd_string=""
+  for arg in "$@"; do
+    printf -v quoted '%q' "$arg"
+    cmd_string+="${quoted} "
+  done
+  # Run under a pseudo-terminal so interactive launchers such as deploy.sh keep
+  # their normal prompts/output behavior while still writing a complete log.
+  PYTHONUNBUFFERED=1 script -q -f -e -c "${cmd_string}" "${log_file}"
+  status=$?
+else
+  PYTHONUNBUFFERED=1 stdbuf -oL -eL "$@" 2>&1 \
+    | tee -a "${log_file}"
+  status=${PIPESTATUS[0]}
+fi
 set -e
 
 echo "[log_stream_debug] command exited with status ${status}" | tee -a "${log_file}"
