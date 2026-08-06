@@ -60,6 +60,7 @@
 #include <unistd.h>
 #include <iostream>
 #include <iomanip>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -1808,6 +1809,23 @@ private:
         const std::vector<ZMQPackedMessageSubscriber::BufferView>& bufs) {
         
         std::lock_guard<std::mutex> lock(data_mutex_);
+        auto receive_time = std::chrono::steady_clock::now();
+        double receive_interval_ms = -1.0;
+        if (last_receive_time_.has_value()) {
+            receive_interval_ms = std::chrono::duration<double, std::milli>(
+                receive_time - last_receive_time_.value()).count();
+        }
+        bool overwrote_unconsumed = has_new_data_;
+        if ((receive_interval_ms >= zmq_receive_gap_warn_ms_) || overwrote_unconsumed) {
+            std::cout << "[ZMQ RX DIAG] receive_interval=" << std::fixed << std::setprecision(2)
+                      << receive_interval_ms << "ms threshold=" << zmq_receive_gap_warn_ms_
+                      << "ms topic='" << topic << "' protocol_version=" << hdr.version
+                      << " fields=" << hdr.fields.size()
+                      << " buffers=" << bufs.size()
+                      << " receive_count=" << receive_count_
+                      << " overwrote_unconsumed=" << (overwrote_unconsumed ? 1 : 0)
+                      << std::endl;
+        }
         
         if (verbose_) {
             std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic
@@ -1827,7 +1845,7 @@ private:
         }
         
         has_new_data_ = true;
-        last_receive_time_ = std::chrono::steady_clock::now();
+        last_receive_time_ = receive_time;
         receive_count_++;
     }
     
@@ -1860,6 +1878,7 @@ private:
     std::optional<std::chrono::steady_clock::time_point> last_receive_time_{}; ///< Timestamp of last OnPoseDataReceived (ms, monotonic).
     uint64_t receive_count_ = 0;       ///< Total number of messages received.
     uint64_t last_decode_time_ = 0;    ///< Timestamp of last DecodeIntoMotionSequence call (ms).
+    double zmq_receive_gap_warn_ms_ = 100.0; ///< Warn when pose ZMQ receive interval is too large.
     
 };
 

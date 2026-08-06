@@ -24,6 +24,7 @@
 
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
+import math
 import os
 import subprocess
 import threading
@@ -835,6 +836,105 @@ def _interp_pose_axis_angle(
     return out_pose
 
 
+_XRT_JOINT_NAMES = [
+    "Pelvis",
+    "Left_Hip",
+    "Right_Hip",
+    "Spine1",
+    "Left_Knee",
+    "Right_Knee",
+    "Spine2",
+    "Left_Ankle",
+    "Right_Ankle",
+    "Spine3",
+    "Left_Foot",
+    "Right_Foot",
+    "Neck",
+    "Left_Collar",
+    "Right_Collar",
+    "Head",
+    "Left_Shoulder",
+    "Right_Shoulder",
+    "Left_Elbow",
+    "Right_Elbow",
+    "Left_Wrist",
+    "Right_Wrist",
+    "Left_Hand",
+    "Right_Hand",
+]
+
+
+def _xrt_call_or_none(name: str):
+    if xrt is None or not hasattr(xrt, name):
+        return None
+    try:
+        return getattr(xrt, name)()
+    except Exception:
+        return None
+
+
+def _as_int_or_zero(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_float_or_nan(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _quat_norm_from_pose(pose) -> float:
+    try:
+        vals = list(pose)
+    except TypeError:
+        return float("nan")
+    if len(vals) < 7:
+        return float("nan")
+    return math.sqrt(
+        float(vals[3]) * float(vals[3])
+        + float(vals[4]) * float(vals[4])
+        + float(vals[5]) * float(vals[5])
+        + float(vals[6]) * float(vals[6])
+    )
+
+
+def _robotics_service_snapshot() -> str:
+    """Small process snapshot for XRoboToolkit PC service diagnostics."""
+    try:
+        pgrep = subprocess.run(
+            ["pgrep", "-f", "RoboticsServiceProcess|roboticsservice"],
+            text=True,
+            capture_output=True,
+            timeout=0.2,
+            check=False,
+        )
+        pids = [p.strip() for p in pgrep.stdout.splitlines() if p.strip()]
+        if not pids:
+            return "service=none"
+        pid_arg = ",".join(pids[:6])
+        ps = subprocess.run(
+            ["ps", "-o", "pid=,pcpu=,pmem=,stat=,etime=,comm=", "-p", pid_arg],
+            text=True,
+            capture_output=True,
+            timeout=0.2,
+            check=False,
+        )
+        rows = []
+        for line in ps.stdout.splitlines():
+            fields = line.split(None, 5)
+            if len(fields) >= 6:
+                rows.append(
+                    f"{fields[0]}:{fields[1]}%cpu:{fields[2]}%mem:{fields[3]}:{fields[4]}:{fields[5]}"
+                )
+        return "service=" + (";".join(rows) if rows else ",".join(pids[:6]))
+    except Exception as exc:
+        return f"service=ERR:{type(exc).__name__}"
+
+
 class PicoReader:
     """
     Background reader that pulls Pico/XRT data as fast as possible and computes dt/FPS.
@@ -868,12 +968,77 @@ class PicoReader:
         self._no_data_polls = 0
         self._last_sample_monotonic = None
 
-    def _diag(self, message: str, min_interval_s: float = 1.0):
+    def _xrt_snapshot(self) -> str:
+        body_available = bool(_xrt_call_or_none("is_body_data_available"))
+        generic_stamp_ns = _as_int_or_zero(_xrt_call_or_none("get_time_stamp_ns"))
+        body_stamp_ns = _as_int_or_zero(_xrt_call_or_none("get_body_timestamp_ns"))
+        motion_num = _as_int_or_zero(_xrt_call_or_none("num_motion_data_available"))
+        motion_stamp_ns = (
+            _as_int_or_zero(_xrt_call_or_none("get_motion_timestamp_ns")) if motion_num > 0 else 0
+        )
+
+        parts = [
+            f"xrt_body_avail={int(body_available)}",
+            f"xrt_generic_stamp={generic_stamp_ns}",
+            f"xrt_body_stamp={body_stamp_ns}",
+            f"xrt_motion_num={motion_num}",
+            f"xrt_motion_stamp={motion_stamp_ns}",
+        ]
+
+        if generic_stamp_ns and body_stamp_ns:
+            parts.append(
+                f"xrt_body_generic_delta_ms={(generic_stamp_ns - body_stamp_ns) * 1e-6:.2f}"
+            )
+
+        joint_ts_raw = _xrt_call_or_none("get_body_joints_timestamp")
+        try:
+            joint_ts = [] if joint_ts_raw is None else [int(v) for v in list(joint_ts_raw)]
+        except (TypeError, ValueError):
+            joint_ts = []
+        if joint_ts:
+            zero_count = sum(1 for v in joint_ts if v == 0)
+            nonzero = [(idx, v) for idx, v in enumerate(joint_ts) if v > 0]
+            parts.append(f"xrt_joint_zero={zero_count}")
+            parts.append(f"xrt_joint_nonzero={len(nonzero)}")
+            if nonzero:
+                min_idx, min_ts = min(nonzero, key=lambda item: item[1])
+                max_idx, max_ts = max(nonzero, key=lambda item: item[1])
+                min_name = _XRT_JOINT_NAMES[min_idx] if min_idx < len(_XRT_JOINT_NAMES) else str(min_idx)
+                max_name = _XRT_JOINT_NAMES[max_idx] if max_idx < len(_XRT_JOINT_NAMES) else str(max_idx)
+                parts.append(f"xrt_joint_skew_nonzero_ms={(max_ts - min_ts) * 1e-6:.2f}")
+                parts.append(f"xrt_joint_min={min_name}:{min_ts}")
+                parts.append(f"xrt_joint_max={max_name}:{max_ts}")
+
+        headset_qn = _quat_norm_from_pose(_xrt_call_or_none("get_headset_pose"))
+        if math.isfinite(headset_qn):
+            parts.append(f"xrt_head_qnorm={headset_qn:.3f}")
+
+        a = bool(_xrt_call_or_none("get_A_button"))
+        b = bool(_xrt_call_or_none("get_B_button"))
+        x = bool(_xrt_call_or_none("get_X_button"))
+        y = bool(_xrt_call_or_none("get_Y_button"))
+        parts.append(f"xrt_ABXY={int(a)}{int(b)}{int(x)}{int(y)}")
+        parts.append(
+            "xrt_triggerLR="
+            f"{_as_float_or_nan(_xrt_call_or_none('get_left_trigger')):.2f}/"
+            f"{_as_float_or_nan(_xrt_call_or_none('get_right_trigger')):.2f}"
+        )
+        parts.append(
+            "xrt_gripLR="
+            f"{_as_float_or_nan(_xrt_call_or_none('get_left_grip')):.2f}/"
+            f"{_as_float_or_nan(_xrt_call_or_none('get_right_grip')):.2f}"
+        )
+        parts.append(_robotics_service_snapshot())
+        return " ".join(parts)
+
+    def _diag(self, message: str, min_interval_s: float = 1.0, include_xrt_snapshot: bool = False):
         if not self._profile_reader:
             return
         now = time.time()
         if now - self._last_diag_log >= min_interval_s:
             self._last_diag_log = now
+            if include_xrt_snapshot:
+                message = f"{message} | {self._xrt_snapshot()}"
             print(f"[PicoReader DIAG] {message}", flush=True)
 
     def start(self):
@@ -922,7 +1087,8 @@ class PicoReader:
                         "no_body_data "
                         f"duration={no_data_s * 1000.0:.1f}ms "
                         f"polls={self._no_data_polls} "
-                        f"since_last_sample={since_sample * 1000.0:.1f}ms"
+                        f"since_last_sample={since_sample * 1000.0:.1f}ms",
+                        include_xrt_snapshot=True,
                     )
                 time.sleep(0.001)
                 continue
@@ -949,7 +1115,8 @@ class PicoReader:
                     self._same_stamp_warned = True
                     self._diag(
                         f"same_timestamp_stall duration={same_stamp_s * 1000.0:.1f}ms "
-                        f"count={self._same_stamp_count} stamp_ns={stamp_ns}"
+                        f"count={self._same_stamp_count} stamp_ns={stamp_ns}",
+                        include_xrt_snapshot=True,
                     )
                 time.sleep(0.000001)
                 continue
@@ -983,16 +1150,19 @@ class PicoReader:
                     f"timestamp_backward prev={prev_stamp_ns} curr={stamp_ns} "
                     f"delta={(stamp_ns - prev_stamp_ns) * 1e-6:.2f}ms",
                     min_interval_s=0.0,
+                    include_xrt_snapshot=True,
                 )
             elif device_dt >= self._anomaly_dt_s:
                 self._diag(
                     f"timestamp_gap device_dt={device_dt * 1000.0:.2f}ms "
-                    f"pc_dt={pc_dt * 1000.0:.2f}ms"
+                    f"pc_dt={pc_dt * 1000.0:.2f}ms",
+                    include_xrt_snapshot=True,
                 )
             elif pc_dt >= self._anomaly_dt_s:
                 self._diag(
                     f"pc_gap_without_device_gap pc_dt={pc_dt * 1000.0:.2f}ms "
-                    f"device_dt={device_dt * 1000.0:.2f}ms"
+                    f"device_dt={device_dt * 1000.0:.2f}ms",
+                    include_xrt_snapshot=True,
                 )
 
             if device_dt > 0.0:
@@ -1009,7 +1179,8 @@ class PicoReader:
                     self._diag(
                         f"get_body_joints_pose_slow read={read_s * 1000.0:.2f}ms "
                         f"device_dt={device_dt * 1000.0:.2f}ms "
-                        f"pc_dt={pc_dt * 1000.0:.2f}ms"
+                        f"pc_dt={pc_dt * 1000.0:.2f}ms",
+                        include_xrt_snapshot=True,
                     )
 
                 sample = {

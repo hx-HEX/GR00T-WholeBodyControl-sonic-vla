@@ -45,6 +45,17 @@ PATTERNS = {
     "loop_timing": re.compile(
         rf"Streaming data mean delay: ({FLOAT})ms, Streaming data std delay: ({FLOAT})ms"
     ),
+    "xrt_snapshot": re.compile(
+        r"xrt_body_avail=(\d+) .*xrt_generic_stamp=(\d+) .*xrt_body_stamp=(\d+) .*xrt_motion_num=(\d+)"
+    ),
+    "xrt_joint": re.compile(
+        rf"xrt_joint_zero=(\d+) xrt_joint_nonzero=(\d+)(?: xrt_joint_skew_nonzero_ms=({FLOAT}))?"
+    ),
+    "xrt_head_qnorm": re.compile(rf"xrt_head_qnorm=({FLOAT})"),
+    "xrt_service": re.compile(r"service=([^\s]+)"),
+    "zmq_rx_diag": re.compile(
+        rf"\[ZMQ RX DIAG\] receive_interval=({FLOAT})ms .*receive_count=(\d+) overwrote_unconsumed=(\d+)"
+    ),
 }
 
 
@@ -84,16 +95,58 @@ def parse_log(path: Path) -> dict[str, Metric | int | dict[str, int]]:
         "streaming_std_delay_ms": Metric(),
         "loop_streaming_mean_delay_ms": Metric(),
         "loop_streaming_std_delay_ms": Metric(),
+        "xrt_joint_zero": Metric(),
+        "xrt_joint_nonzero": Metric(),
+        "xrt_joint_skew_nonzero_ms": Metric(),
+        "xrt_head_qnorm": Metric(),
+        "zmq_rx_interval_ms": Metric(),
         "pose_skip_counts": {},
+        "xrt_counts": {},
+        "zmq_counts": {},
         "lines": 0,
     }
 
     skip_counts = metrics["pose_skip_counts"]
     assert isinstance(skip_counts, dict)
+    xrt_counts = metrics["xrt_counts"]
+    assert isinstance(xrt_counts, dict)
+    zmq_counts = metrics["zmq_counts"]
+    assert isinstance(zmq_counts, dict)
 
     with path.open("r", errors="replace") as f:
         for line in f:
             metrics["lines"] = int(metrics["lines"]) + 1
+
+            if "[PicoReader DIAG]" in line and "xrt_body_avail=" in line:
+                xrt_counts["snapshot_lines"] = xrt_counts.get("snapshot_lines", 0) + 1
+                if m := PATTERNS["xrt_snapshot"].search(line):
+                    body_avail = int(m.group(1))
+                    generic_stamp = int(m.group(2))
+                    body_stamp = int(m.group(3))
+                    motion_num = int(m.group(4))
+                    if body_avail == 0:
+                        xrt_counts["body_unavailable"] = xrt_counts.get("body_unavailable", 0) + 1
+                    if generic_stamp == 0:
+                        xrt_counts["generic_stamp_zero"] = xrt_counts.get("generic_stamp_zero", 0) + 1
+                    if body_stamp == 0:
+                        xrt_counts["body_stamp_zero"] = xrt_counts.get("body_stamp_zero", 0) + 1
+                    if motion_num == 0:
+                        xrt_counts["motion_num_zero"] = xrt_counts.get("motion_num_zero", 0) + 1
+                if m := PATTERNS["xrt_joint"].search(line):
+                    cast(Metric, metrics["xrt_joint_zero"]).add(float(m.group(1)))
+                    cast(Metric, metrics["xrt_joint_nonzero"]).add(float(m.group(2)))
+                    if m.group(3) is not None:
+                        cast(Metric, metrics["xrt_joint_skew_nonzero_ms"]).add(float(m.group(3)))
+                if m := PATTERNS["xrt_head_qnorm"].search(line):
+                    cast(Metric, metrics["xrt_head_qnorm"]).add(float(m.group(1)))
+                if m := PATTERNS["xrt_service"].search(line):
+                    service = m.group(1)
+                    if service == "none":
+                        xrt_counts["service_none"] = xrt_counts.get("service_none", 0) + 1
+                    elif service.startswith("ERR:"):
+                        xrt_counts["service_error"] = xrt_counts.get("service_error", 0) + 1
+                    else:
+                        xrt_counts["service_present"] = xrt_counts.get("service_present", 0) + 1
 
             if m := PATTERNS["pico_timestamp_gap"].search(line):
                 cast(Metric, metrics["pico_device_gap_ms"]).add(float(m.group(1)))
@@ -136,6 +189,13 @@ def parse_log(path: Path) -> dict[str, Metric | int | dict[str, int]]:
             if m := PATTERNS["loop_timing"].search(line):
                 cast(Metric, metrics["loop_streaming_mean_delay_ms"]).add(float(m.group(1)))
                 cast(Metric, metrics["loop_streaming_std_delay_ms"]).add(float(m.group(2)))
+                continue
+            if m := PATTERNS["zmq_rx_diag"].search(line):
+                cast(Metric, metrics["zmq_rx_interval_ms"]).add(float(m.group(1)))
+                if int(m.group(3)) != 0:
+                    zmq_counts["overwrote_unconsumed"] = zmq_counts.get("overwrote_unconsumed", 0) + 1
+                else:
+                    zmq_counts["receive_gap"] = zmq_counts.get("receive_gap", 0) + 1
                 continue
 
     return metrics
@@ -184,6 +244,11 @@ def main() -> int:
             "streaming_std_delay_ms",
             "loop_streaming_mean_delay_ms",
             "loop_streaming_std_delay_ms",
+            "xrt_joint_zero",
+            "xrt_joint_nonzero",
+            "xrt_joint_skew_nonzero_ms",
+            "xrt_head_qnorm",
+            "zmq_rx_interval_ms",
         ):
             metric = metrics[key]
             assert isinstance(metric, Metric)
@@ -198,11 +263,29 @@ def main() -> int:
             )
             print(f"pose_skip_counts: {top}")
 
+        xrt_counts = metrics["xrt_counts"]
+        assert isinstance(xrt_counts, dict)
+        if xrt_counts:
+            top = ", ".join(
+                f"{k}={v}" for k, v in sorted(xrt_counts.items(), key=lambda kv: kv[0])
+            )
+            print(f"xrt_counts: {top}")
+
+        zmq_counts = metrics["zmq_counts"]
+        assert isinstance(zmq_counts, dict)
+        if zmq_counts:
+            top = ", ".join(
+                f"{k}={v}" for k, v in sorted(zmq_counts.items(), key=lambda kv: kv[0])
+            )
+            print(f"zmq_counts: {top}")
+
     print("\nInterpretation:")
     print("- pico_device_gap_ms/stall_ms high: XRoboToolkit/PICO source is not producing fresh timestamps.")
     print("- pose_drop_fps low with wait/stale skips: PoseLoop cannot synthesize target-rate frames from PICO samples.")
     print("- streaming_age_ms high: SONIC deploy did not receive/process fresh ZMQ input for >150ms.")
     print("- loop_streaming_* high without streaming_age_ms: rolling stats include earlier spikes; inspect timeline.")
+    print("- xrt_counts from new logs distinguish SDK-visible body availability/stamps/service status during anomalies.")
+    print("- zmq_rx_interval_ms high means SONIC is receiving pose packets late; overwrite counts mean callback outran the control consumer.")
     return 0
 
 
